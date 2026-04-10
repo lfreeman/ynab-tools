@@ -1,0 +1,39 @@
+[project]
+name = "ynab-tools"
+version = "0.2.0"
+description = "YNAB CLI — personal finance from the terminal"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "python-dotenv>=1.2.1",
+    "rich>=13.0.0",
+    "typer>=0.15.0",
+    "ynab>=4.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+ynab = "ynab_tools.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ynab_tools"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = ["src/ynab_tools/_legacy"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.9.0",
+]
