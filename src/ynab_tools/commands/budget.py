@@ -1,15 +1,17 @@
 """Budget commands."""
 
 import json
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from ..api import client
-from ..config import load_config, save_config
-from ..utils.formatting import format_amount, format_amount_colored
+from ..config import ProfileError, load_config, save_config
+from ..utils.formatting import err_console, format_amount, format_amount_colored, print_json
 
 app = typer.Typer(help="Budget management.", no_args_is_help=True)
 console = Console()
@@ -29,7 +31,7 @@ def list_budgets(
         raise typer.Exit(1)
 
     if json_output:
-        console.print(json.dumps([b.to_dict() for b in budgets], indent=2, default=str))
+        print_json([b.to_dict() for b in budgets])
         return
 
     config = load_config()
@@ -73,125 +75,74 @@ def use_budget(
 
 @app.command("assign")
 def assign_budget(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be assigned without making changes"),
+    apply: bool = typer.Option(False, "--apply", help="Write the reviewed plan given by --plan"),
+    plan_file: Path | None = typer.Option(
+        None, "--plan", help="Plan file: the JSON a preview printed, as the owner reviewed it"
+    ),
+    month: str | None = typer.Option(None, "--month", "-m", help="Month (YYYY-MM) to preview, default current"),
+    json_output: bool = JsonFlag,
     budget: str | None = typer.Option(None, "--budget", "-b", help="Budget ID override"),
 ):
-    """Auto-assign RTA: cover overspent → fund goals → fix CC mismatches."""
-    import ynab as ynab_sdk
+    """Propose how to assign Ready to Assign; write only a reviewed plan.
 
+    Previews by default and writes nothing: cover overspending, then card
+    payment shortfalls, then this month's target needs, then the safety net
+    and goals. --json prints the plan; save it, edit `to` amounts or remove
+    items, then --apply --plan FILE writes it. Apply refuses a plan whose
+    categories changed since the preview, and skips items already applied.
+    """
+    from ..money.assign import PlanError, apply_plan, assign_answer
+    from .money import _emit
+
+    if apply != (plan_file is not None):
+        err_console.print("[red]--apply and --plan go together: preview first, then apply the saved plan.[/red]")
+        raise typer.Exit(1)
     try:
-        month_str = date.today().replace(day=1).isoformat()
-        month_data = client.get_month(month_str, budget_id=budget)
-        accounts = client.list_accounts(budget_id=budget)
-    except RuntimeError as e:
-        console.print(f"[red]{e}[/red]")
+        if plan_file is not None:
+            answer = apply_plan(json.loads(plan_file.read_text()), budget_id=budget)
+        else:
+            answer = assign_answer(
+                budget_id=budget, month=date.fromisoformat(f"{month}-01") if month else None
+            )
+    except (RuntimeError, ProfileError, PlanError, OSError, ValueError) as e:
+        err_console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(1)
 
-    rta = month_data.to_be_budgeted or 0
-    if rta <= 0:
-        console.print(f"[dim]Ready to Assign: {format_amount(rta)} — nothing to assign.[/dim]")
+    if json_output:
+        print_json(answer)
+    else:
+        _print_assign_items(answer["items"])
+        _emit(answer, False)
+    if answer.get("outcome") in ("stale_plan", "refused", "partial"):
+        raise typer.Exit(1)
+
+
+def _print_assign_items(items: list[dict]) -> None:
+    """Print a plan's items as a table, with each item's outcome when it has one."""
+    if not items:
+        console.print("[green]✓[/green] Nothing to assign.")
         return
-
-    cats = [c for c in month_data.categories if not c.deleted and not c.hidden]
-    assignments = []
-
-    # Step 1: Cover overspent
-    for c in cats:
-        if (c.balance or 0) < 0:
-            group = c.category_group_name or "Other"
-            if group.lower() == "hidden categories":
-                continue
-            needed = abs(c.balance)
-            assignments.append({"id": str(c.id), "name": c.name, "group": group, "amount": needed, "step": "overspent"})
-
-    # Step 2: Fund underfunded goals
-    for c in cats:
-        uf = getattr(c, "goal_under_funded", None) or 0
-        if uf > 0:
-            group = c.category_group_name or "Other"
-            # Skip if already in overspent list
-            if any(a["id"] == str(c.id) for a in assignments):
-                continue
-            assignments.append({"id": str(c.id), "name": c.name, "group": group, "amount": uf, "step": "underfunded"})
-
-    # Step 3: Fix CC payment mismatches
-    # When step 1 covers overspent-on-credit categories, YNAB automatically
-    # moves that money to the CC payment category. Skip CC gap-filling when
-    # step 1 has overspent items to avoid double-funding.
-    has_overspent = any(a["step"] == "overspent" for a in assignments)
-    cc_accounts = {
-        a.name: abs(a.balance or 0)
-        for a in accounts
-        if not a.closed and getattr(a, "type", "") == "creditCard"
-    }
-    for c in cats:
-        if (c.category_group_name or "").lower() != "credit card payments":
-            continue
-        card_balance = cc_accounts.get(c.name)
-        if card_balance is None:
-            continue
-        available = c.balance or 0
-        gap = card_balance - available
-        if gap > 0:
-            if has_overspent:
-                # Overspent coverage will auto-fund CC payments via YNAB;
-                # re-run budget assign after to catch any remaining gap
-                continue
-            assignments.append({
-                "id": str(c.id), "name": c.name,
-                "group": "Credit Card Payments", "amount": gap, "step": "cc_mismatch",
-            })
-
-    if not assignments:
-        console.print("[green]✓[/green] Nothing to assign — budget is clean!")
-        return
-
-    total = sum(a["amount"] for a in assignments)
-    remaining = rta - total
-
-    # Display plan
-    console.print(f"\n[bold]Budget Assignment Plan — {month_str[:7]}[/bold]")
-    console.print(f"Ready to Assign: {format_amount(rta)}\n")
-
-    step_labels = {"overspent": "Cover Overspent", "underfunded": "Fund Goals", "cc_mismatch": "Fix CC Payments"}
-    for step in ("overspent", "underfunded", "cc_mismatch"):
-        step_items = [a for a in assignments if a["step"] == step]
-        if not step_items:
-            continue
-        step_total = sum(a["amount"] for a in step_items)
-        console.print(f"[bold]{step_labels[step]}[/bold] ({format_amount(step_total)})")
-        for a in step_items:
-            console.print(f"  {format_amount(a['amount']):>12}  → {a['name']}")
-        console.print()
-
-    console.print(f"Total: {format_amount(total)}")
-    console.print(f"Remaining RTA: {format_amount(remaining)}")
-
-    if dry_run:
-        console.print("\n[dim]Dry run — no changes made.[/dim]")
-        return
-
-    # Execute
-    console.print()
-    api = ynab_sdk.CategoriesApi(client._get_client())
-    bid = client._budget_id(budget)
-    success = 0
-    for a in assignments:
-        # Get current budgeted for this category
-        cat = next((c for c in cats if str(c.id) == a["id"]), None)
-        if not cat:
-            continue
-        new_budgeted = (cat.budgeted or 0) + a["amount"]
-        try:
-            wrapper = ynab_sdk.PatchMonthCategoryWrapper(
-                category=ynab_sdk.SaveMonthCategory(budgeted=new_budgeted)
-            )
-            api.update_month_category(bid, month_str, a["id"], wrapper)
-            success += 1
-        except Exception as e:
-            console.print(f"[red]  ✗ {a['name']}: {e}[/red]")
-
-    console.print(f"[green]✓[/green] Assigned {format_amount(total)} across {success} categories")
+    table = Table(title="Assignment plan")
+    table.add_column("Step")
+    table.add_column("Category")
+    table.add_column("From", justify="right")
+    table.add_column("To", justify="right")
+    table.add_column("Change", justify="right")
+    with_outcome = "outcome" in items[0]
+    if with_outcome:
+        table.add_column("Outcome")
+    for i in items:
+        row = [
+            i.get("step", ""),
+            escape(str(i.get("category", i["category_id"]))),
+            format_amount(i["from"]),
+            format_amount(i["to"]),
+            format_amount(i["to"] - i["from"]),
+        ]
+        if with_outcome:
+            row.append(i["outcome"])
+        table.add_row(*row)
+    console.print(table)
 
 
 @app.command("plan")
@@ -248,7 +199,7 @@ def plan_budget(
                 }
                 for c in gcats
             ]
-        console.print(json.dumps(out, indent=2, default=str))
+        print_json(out)
         return
 
     # Header
@@ -304,23 +255,46 @@ def plan_budget(
 
 @app.command("check")
 def check_budget(
+    month: str | None = typer.Option(None, "--month", "-m", help="Month (YYYY-MM), default current"),
     budget: str | None = typer.Option(None, "--budget", "-b", help="Budget ID override"),
 ):
-    """Health check — overspent categories, unreconciled accounts, etc."""
+    """Health check — overspent categories, unreconciled accounts, etc.
+
+    With `--month`, checks that month's category balances and only the
+    transactions dated in it. Checks that describe today rather than a month —
+    reconciliation age, card balances against payment categories, Age of
+    Money — are skipped for a past month.
+    """
+    from .tx import _find_mirrored_adjustments
+
+    current = date.today().replace(day=1)
+    month_start = date.fromisoformat(f"{month}-01") if month else current
+    is_past = month_start < current
+    month_str = month_start.isoformat()
+    next_month = (month_start + timedelta(days=32)).replace(day=1).isoformat()
     try:
-        month_str = date.today().replace(day=1).isoformat()
         month_data = client.get_month(month_str, budget_id=budget)
         accounts = client.list_accounts(budget_id=budget)
-        categories = client.list_categories(budget_id=budget)
+        if is_past:
+            # Only the month endpoint knows a past month's balances.
+            rows = [(c.category_group_name or "", c) for c in (month_data.categories or [])]
+        else:
+            rows = [(g.name, c) for g in client.list_categories(budget_id=budget) for c in g.categories]
     except RuntimeError as e:
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(1)
 
     try:
         txs = client.list_transactions(budget_id=budget, since_date=month_str)
+        txs = [t for t in txs if str(t.var_date)[:10] < next_month]
     except RuntimeError:
         txs = []
 
+    rows = [
+        (group_name, cat) for group_name, cat in rows
+        if group_name.lower() not in ("internal master category", "hidden categories")
+        and not cat.hidden and not cat.deleted
+    ]
     issues = 0
     warnings = 0
 
@@ -339,16 +313,10 @@ def check_budget(
 
     # 2. Overspent categories
     overspent = []
-    for group in categories:
-        group_name = group.name
-        if group_name.lower() in ("internal master category", "hidden categories"):
-            continue
-        for cat in group.categories:
-            if cat.hidden or cat.deleted:
-                continue
-            balance = getattr(cat, "balance", 0) or 0
-            if balance < 0:
-                overspent.append((group_name, cat.name, balance))
+    for group_name, cat in rows:
+        balance = getattr(cat, "balance", 0) or 0
+        if balance < 0:
+            overspent.append((group_name, cat.name, balance))
 
     if not overspent:
         console.print("[green]  PASS[/green]  No overspent categories")
@@ -361,7 +329,7 @@ def check_budget(
     # 3. Accounts not reconciled in 30+ days
     active_accounts = [a for a in accounts if not a.closed]
     stale_accounts = []
-    for a in active_accounts:
+    for a in ([] if is_past else active_accounts):
         last_rec = getattr(a, "last_reconciled_at", None)
         if last_rec:
             rec_date = date.fromisoformat(str(last_rec)[:10])
@@ -371,7 +339,12 @@ def check_budget(
         else:
             stale_accounts.append((a.name, None))
 
-    if not stale_accounts:
+    if is_past:
+        console.print(
+            "[dim]  INFO[/dim]  Reconciliation age, card balances and Age of Money:"
+            " skipped for a past month (they describe today)"
+        )
+    elif not stale_accounts:
         console.print("[green]  PASS[/green]  All accounts reconciled within 30 days")
     else:
         warnings += len(stale_accounts)
@@ -383,22 +356,16 @@ def check_budget(
                 console.print(f"         {name}: never reconciled")
 
     # 4. Credit card payment vs balance mismatch
-    cc_accounts = [a for a in active_accounts if getattr(a, "type", "") == "creditCard"]
+    cc_accounts = [] if is_past else [a for a in active_accounts if getattr(a, "type", "") == "creditCard"]
     cc_issues = []
     for cc in cc_accounts:
-        cc_balance = abs(getattr(cc, "balance", 0) or 0)
-        # Find matching credit card payment category
-        for group in categories:
-            if group.name.lower() != "credit card payments":
-                continue
-            for cat in group.categories:
-                if cat.hidden or cat.deleted:
-                    continue
-                if cat.name == cc.name:
-                    payment_available = getattr(cat, "balance", 0) or 0
-                    diff = abs(payment_available - cc_balance)
-                    if diff > 1000:  # More than $1 difference
-                        cc_issues.append((cc.name, cc_balance, payment_available))
+        # Negative balance = owed; positive = card is in credit, nothing to fund.
+        cc_balance = max(0, -(getattr(cc, "balance", 0) or 0))
+        for group_name, cat in rows:
+            if group_name.lower() == "credit card payments" and cat.name == cc.name:
+                payment_available = getattr(cat, "balance", 0) or 0
+                if abs(payment_available - cc_balance) > 1000:  # More than $1 difference
+                    cc_issues.append((cc.name, cc_balance, payment_available))
 
     if cc_accounts and not cc_issues:
         console.print("[green]  PASS[/green]  Credit card payments match balances")
@@ -412,16 +379,10 @@ def check_budget(
 
     # 5. Underfunded goals
     underfunded = []
-    for group in categories:
-        group_name = group.name
-        if group_name.lower() in ("internal master category", "hidden categories"):
-            continue
-        for cat in group.categories:
-            if cat.hidden or cat.deleted:
-                continue
-            uf = getattr(cat, "goal_under_funded", None) or 0
-            if uf > 0:
-                underfunded.append((group_name, cat.name, uf))
+    for group_name, cat in rows:
+        uf = getattr(cat, "goal_under_funded", None) or 0
+        if uf > 0:
+            underfunded.append((group_name, cat.name, uf))
 
     if not underfunded:
         console.print("[green]  PASS[/green]  All goals fully funded")
@@ -434,19 +395,23 @@ def check_budget(
         for group_name, cat_name, uf in underfunded:
             console.print(f"         {group_name} > {cat_name}: {format_amount(uf)} needed")
 
-    # 6. Age of Money
+    # 6. Age of Money (skipped for a past month; reported under check 3)
     age_of_money = getattr(month_data, "age_of_money", None)
-    if age_of_money is not None:
-        if age_of_money >= 30:
+    if not is_past:
+        if age_of_money is None:
+            console.print("[dim]  INFO[/dim]  Age of Money: not available")
+        elif age_of_money >= 30:
             console.print(f"[green]  PASS[/green]  Age of Money: {age_of_money} days")
         else:
             warnings += 1
             console.print(f"[yellow]  WARN[/yellow]  Age of Money: {age_of_money} days (< 30)")
-    else:
-        console.print("[dim]  INFO[/dim]  Age of Money: not available")
 
     # 7. Uncategorized transactions
-    uncategorized = [t for t in txs if not t.deleted and not t.transfer_account_id and not t.category_id]
+    uncategorized = [
+        t for t in txs
+        if not t.deleted and not t.transfer_account_id and not t.category_id
+        and (t.payee_name or "") not in ("Starting Balance", "Manual Balance Adjustment")
+    ]
     if not uncategorized:
         console.print("[green]  PASS[/green]  No uncategorized transactions")
     else:
@@ -460,6 +425,22 @@ def check_budget(
     else:
         warnings += len(unapproved)
         console.print(f"[yellow]  WARN[/yellow]  {len(unapproved)} unapproved transaction(s)")
+
+    # 9. Mirrored reconciliation adjustments
+    mirrored = _find_mirrored_adjustments([t for t in txs if not t.deleted])
+    if not mirrored:
+        console.print("[green]  PASS[/green]  No mirrored reconciliation adjustments")
+    else:
+        warnings += len(mirrored)
+        console.print(
+            f"[yellow]  WARN[/yellow]  {len(mirrored)} mirrored reconciliation adjustment pair(s)"
+            " — likely a payment linked to the wrong account:"
+        )
+        for neg, pos in mirrored:
+            console.print(
+                f"         {neg.var_date}: {(neg.account_name or '').strip()} {format_amount(neg.amount)}"
+                f" / {(pos.account_name or '').strip()} {format_amount(pos.amount)}"
+            )
 
     # Summary
     console.print()

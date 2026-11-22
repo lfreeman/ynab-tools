@@ -1,10 +1,12 @@
 """YNAB API client wrapper."""
 
+from datetime import date, timedelta
 from functools import lru_cache
 
 import ynab
 
 from ..config import load_config
+from .ratelimit import RateLimitedApiClient
 
 
 @lru_cache
@@ -14,7 +16,7 @@ def _get_client() -> ynab.ApiClient:
     if not config.api_key:
         raise RuntimeError("YNAB_API_KEY not set. Add it to .env or set as environment variable.")
     configuration = ynab.Configuration(access_token=config.api_key)
-    return ynab.ApiClient(configuration)
+    return RateLimitedApiClient(configuration)
 
 
 def _budget_id(budget_id: str | None = None) -> str:
@@ -55,6 +57,47 @@ def list_categories(budget_id: str | None = None) -> list:
     api = ynab.CategoriesApi(_get_client())
     response = api.get_categories(_budget_id(budget_id))
     return response.data.category_groups
+
+
+def create_category_group(name: str, budget_id: str | None = None):
+    """Create a category group named `name`; returns the new group."""
+    api = ynab.CategoriesApi(_get_client())
+    wrapper = ynab.PostCategoryGroupWrapper(category_group=ynab.SaveCategoryGroup(name=name))
+    response = api.create_category_group(_budget_id(budget_id), wrapper)
+    return response.data.category_group
+
+
+def create_category(name: str, category_group_id: str, budget_id: str | None = None, **fields):
+    """Create a category in a group; returns the new category.
+
+    `fields` may set any other `NewCategory` field, such as `goal_target`
+    (milliunits) or `goal_target_date`.
+    """
+    api = ynab.CategoriesApi(_get_client())
+    wrapper = ynab.PostCategoryWrapper(
+        category=ynab.NewCategory(name=name, category_group_id=category_group_id, **fields)
+    )
+    response = api.create_category(_budget_id(budget_id), wrapper)
+    return response.data.category
+
+
+def update_category(category_id: str, data: dict, budget_id: str | None = None):
+    """Update a category's `ExistingCategory` fields from `data`; returns the category."""
+    api = ynab.CategoriesApi(_get_client())
+    wrapper = ynab.PatchCategoryWrapper(category=ynab.ExistingCategory(**data))
+    response = api.update_category(_budget_id(budget_id), category_id, wrapper)
+    return response.data.category
+
+
+def update_month_category(month: str, category_id: str, budgeted: int, budget_id: str | None = None):
+    """Set a category's assigned amount for `month` (YYYY-MM-01) to `budgeted` milliunits.
+
+    The amount replaces what is assigned; it is not added to it. Returns the category.
+    """
+    api = ynab.CategoriesApi(_get_client())
+    wrapper = ynab.PatchMonthCategoryWrapper(category=ynab.SaveMonthCategory(budgeted=budgeted))
+    response = api.update_month_category(_budget_id(budget_id), month, category_id, wrapper)
+    return response.data.category
 
 
 # ── Payees ───────────────────────────────────────────────────────────────────
@@ -186,6 +229,19 @@ def get_month(month: str, budget_id: str | None = None):
     api = ynab.MonthsApi(_get_client())
     response = api.get_plan_month(_budget_id(budget_id), month)
     return response.data.month
+
+
+def get_month_history(month: str, count: int, budget_id: str | None = None) -> list:
+    """The `count` full months before `month` (YYYY-MM-01), most recent first.
+
+    One request per month, so `count` requests in all.
+    """
+    current = date.fromisoformat(month)
+    months = []
+    for _ in range(count):
+        current = (current - timedelta(days=1)).replace(day=1)
+        months.append(get_month(current.isoformat(), budget_id=budget_id))
+    return months
 
 
 # ── Scheduled Transactions ──────────────────────────────────────────────────

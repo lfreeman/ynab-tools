@@ -1,13 +1,12 @@
 """Category commands."""
 
-import json
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from ..api import client
-from ..utils.formatting import format_amount, format_amount_colored, short_id
+from ..utils.formatting import format_amount, format_amount_colored, print_json, short_id
 
 app = typer.Typer(help="Category management.", no_args_is_help=True)
 console = Console()
@@ -30,7 +29,7 @@ def list_categories(
         raise typer.Exit(1)
 
     if json_output:
-        console.print(json.dumps([g.to_dict() for g in groups], indent=2, default=str))
+        print_json([g.to_dict() for g in groups])
         return
 
     table = Table(title="Categories")

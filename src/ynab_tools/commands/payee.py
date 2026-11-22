@@ -1,12 +1,11 @@
 """Payee commands."""
 
-import json
-
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from ..api import client
+from ..utils.formatting import print_json
 
 app = typer.Typer(help="Payee management.", no_args_is_help=True)
 console = Console()
@@ -40,7 +39,7 @@ def list_payees(
         payees = payees[:limit]
 
     if json_output:
-        console.print(json.dumps([p.to_dict() for p in payees], indent=2, default=str))
+        print_json([p.to_dict() for p in payees])
         return
 
     table = Table(title=f"Payees ({len(payees)})")

@@ -1,6 +1,5 @@
 """Scheduled transaction commands."""
 
-import json
 from collections import defaultdict
 from datetime import date, timedelta
 
@@ -9,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ..api import client
-from ..utils.formatting import format_amount, format_amount_colored
+from ..utils.formatting import format_amount, format_amount_colored, print_json, short_id
 
 app = typer.Typer(help="Scheduled/recurring transactions.", no_args_is_help=True)
 console = Console()
@@ -34,7 +33,7 @@ def list_scheduled(
     scheduled = [s for s in scheduled if not s.deleted]
 
     if json_output:
-        console.print(json.dumps([s.to_dict() for s in scheduled], indent=2, default=str))
+        print_json([s.to_dict() for s in scheduled])
         return
 
     if not scheduled:
@@ -48,6 +47,7 @@ def list_scheduled(
     table.add_column("Frequency")
     table.add_column("Next Date")
     table.add_column("Account")
+    table.add_column("ID", style="dim")
 
     for s in sorted(scheduled, key=lambda x: str(getattr(x, "date_next", "") or "")):
         payee = getattr(s, "payee_name", None) or "—"
@@ -65,9 +65,53 @@ def list_scheduled(
             str(frequency),
             date_str,
             account,
+            short_id(s.id),
         )
 
     console.print(table)
+
+
+@app.command("delete")
+def delete_scheduled(
+    match: str = typer.Argument(..., help="Payee name (substring) or ID prefix"),
+    budget: str | None = BudgetOpt,
+):
+    """Delete one scheduled transaction, chosen by payee or ID prefix.
+
+    Refuses unless exactly one schedule matches, listing the candidates with
+    their IDs so a prefix can disambiguate. Transactions already created from
+    the schedule are not touched.
+    """
+    try:
+        scheduled = [s for s in client.list_scheduled_transactions(budget_id=budget) if not s.deleted]
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    by_id = [s for s in scheduled if str(s.id).startswith(match)]
+    needle = match.lower()
+    matches = by_id or [s for s in scheduled if needle in (s.payee_name or "").lower()]
+
+    if not matches:
+        console.print(f"[red]No scheduled transaction matches '{match}'.[/red]")
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[yellow]{len(matches)} scheduled transactions match '{match}' — pass an ID prefix:[/yellow]")
+        for s in matches:
+            console.print(
+                f"  {short_id(s.id)}  {s.payee_name}  {format_amount(s.amount)}"
+                f"  next {s.date_next}  ({(s.account_name or '').strip()})"
+            )
+        raise typer.Exit(1)
+
+    import ynab as ynab_sdk
+
+    s = matches[0]
+    api = ynab_sdk.ScheduledTransactionsApi(client._get_client())
+    api.delete_scheduled_transaction(client._budget_id(budget), str(s.id))
+    console.print(
+        f"[green]✓[/green] Deleted scheduled {s.payee_name} {format_amount(s.amount)} (next was {s.date_next})"
+    )
 
 
 def _check_scheduled_mismatches(
@@ -153,7 +197,7 @@ def check_scheduled(
         raise typer.Exit(1)
 
     if json_output:
-        console.print(json.dumps(results, indent=2, default=str))
+        print_json(results)
         return
 
     if not results:
@@ -193,3 +237,86 @@ def check_scheduled(
         console.print(f"\n[yellow]{mismatches} mismatch(es) found[/yellow] — review scheduled amounts")
     else:
         console.print("\n[green]All scheduled amounts match recent actuals.[/green]")
+
+@app.command("prune")
+def prune_scheduled(
+    delete: bool = typer.Option(False, "--delete", help="Delete the scheduled transactions listed"),
+    json_output: bool = JsonFlag,
+    budget: str | None = BudgetOpt,
+):
+    """Find scheduled transactions that generate a duplicate every month.
+
+    A scheduled transaction holds one fixed amount. When the real bill varies,
+    YNAB cannot match the entry it auto-creates to the charge that imports, and
+    an unconfirmed duplicate is left behind — inflating that category's spending
+    every month until someone removes it by hand.
+
+    For a bill the bank already imports reliably, the scheduled entry earns
+    nothing and costs a duplicate a month. Deleting it stops the problem at
+    source; the real charge still imports exactly as before.
+    """
+    from .tx import _find_ghosts, _ghost_schedules
+
+    try:
+        scheduled = client.list_scheduled_transactions(budget_id=budget)
+        txs = [t for t in client.list_transactions(budget_id=budget) if not t.deleted]
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
+
+    ghosts, _ = _find_ghosts(txs)
+    offenders = _ghost_schedules(scheduled, ghosts)
+
+    if json_output:
+        print_json([{
+            "scheduled_id": str(s.id),
+            "payee": s.payee_name,
+            "amount": s.amount,
+            "frequency": str(getattr(s, "frequency", "")),
+            "next_date": str(getattr(s, "date_next", "")),
+            "ghosts_produced": len(produced),
+            "ghost_total": sum(g.amount for g in produced),
+        } for s, produced in offenders])
+        return
+
+    if not offenders:
+        console.print("[green]✓[/green] No scheduled transaction is generating duplicates.")
+        return
+
+    table = Table(title=f"Scheduled transactions generating duplicates ({len(offenders)})")
+    table.add_column("Payee")
+    table.add_column("Scheduled", justify="right")
+    table.add_column("Next")
+    table.add_column("Ghosts", justify="right")
+    table.add_column("Wasted", justify="right")
+    for s, produced in sorted(offenders, key=lambda x: -len(x[1])):
+        table.add_row(
+            (s.payee_name or "?")[:30],
+            format_amount(s.amount),
+            str(getattr(s, "date_next", "") or "—"),
+            str(len(produced)),
+            format_amount(sum(g.amount for g in produced)),
+        )
+    console.print(table)
+    console.print(
+        "\n[dim]These bills import from the bank on their own — the scheduled"
+        " entry only adds a duplicate each month.[/dim]"
+    )
+
+    if not delete:
+        console.print("[dim]Remove them with: ynab scheduled prune --delete[/dim]")
+        return
+
+    import ynab as ynab_sdk
+
+    api = ynab_sdk.ScheduledTransactionsApi(client._get_client())
+    bid = client._budget_id(budget)
+    removed = 0
+    for s, _produced in offenders:
+        try:
+            api.delete_scheduled_transaction(bid, str(s.id))
+            removed += 1
+        except Exception as e:
+            console.print(f"[red]  ✗ {s.payee_name}: {e}[/red]")
+    console.print(f"\n[green]✓[/green] Deleted {removed} scheduled transaction(s)")
+    console.print("[dim]Existing duplicates remain — clear them with: ynab tx ghosts --delete[/dim]")

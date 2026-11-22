@@ -1,6 +1,5 @@
 """Report commands — spending, income, payees, trends."""
 
-import json
 from collections import defaultdict
 from datetime import date, timedelta
 
@@ -9,7 +8,7 @@ from rich.console import Console
 from rich.table import Table
 
 from ..api import client
-from ..utils.formatting import format_amount, format_amount_colored
+from ..utils.formatting import format_amount, format_amount_colored, print_json
 
 app = typer.Typer(help="Financial reports and analysis.", no_args_is_help=True)
 console = Console()
@@ -137,7 +136,7 @@ def report_spending(
                     row[mk] = by_month.get(mk, 0)
                 row["total"] = sum(by_month.values())
                 out.append(row)
-        console.print(json.dumps(out, indent=2, default=str))
+        print_json(out)
         return
 
     table = Table(title=f"Spending by Category ({month_keys[0]} to {month_keys[-1]})")
@@ -245,7 +244,7 @@ def report_income(
                     "savings_rate": round(rate, 1),
                 }
             )
-        console.print(json.dumps(out, indent=2, default=str))
+        print_json(out)
         return
 
     table = Table(title="Income vs Expenses")
@@ -340,7 +339,7 @@ def report_payees(
                     "top_category": top_cat,
                 }
             )
-        console.print(json.dumps(out, indent=2, default=str))
+        print_json(out)
         return
 
     table = Table(title=f"Top {len(sorted_payees)} Payees by Spending")
@@ -411,7 +410,7 @@ def report_trends(
                 curr = by_month.get(month_keys[-1], 0)
                 row["change_pct"] = _change_pct(prev, curr)
             out.append(row)
-        console.print(json.dumps(out, indent=2, default=str))
+        print_json(out)
         return
 
     table = Table(title=f"Spending Trends ({month_keys[0]} to {month_keys[-1]})")
@@ -470,7 +469,7 @@ def report_subscriptions(
     subs.sort(key=lambda s: s["annual_cost"], reverse=True)
 
     if json_output:
-        console.print(json.dumps(subs, indent=2, default=str))
+        print_json(subs)
         return
 
     table = Table(title="Recurring Charges (Subscriptions & Bills)")

@@ -16,3 +16,13 @@ __pycache__/
 
 # Data (will contain your financial data)
 data/
+
+# Notebooks — cell outputs embed real account data (names, balances, IDs)
+notebooks/
+
+# Scratch notes
+more.md
+
+# Local docs and plans — kept off the public repo
+docs/
+CLAUDE.local.md

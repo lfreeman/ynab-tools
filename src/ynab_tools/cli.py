@@ -3,7 +3,7 @@
 import typer
 from rich.console import Console
 
-from .commands import acct, budget, cat, payee, report, routine, scheduled, tx
+from .commands import acct, budget, cat, money, payee, report, routine, scheduled, snapshots, tx
 from .config import load_config
 
 app = typer.Typer(name="ynab", no_args_is_help=True)
@@ -17,6 +17,8 @@ app.add_typer(payee.app, name="payee")
 app.add_typer(report.app, name="report")
 app.add_typer(scheduled.app, name="scheduled")
 app.add_typer(routine.app, name="routine")
+app.add_typer(money.app, name="money")
+app.add_typer(snapshots.app, name="snapshot")
 
 
 @app.command()

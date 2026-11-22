@@ -6,11 +6,32 @@ Personal finance AI assistant that connects to YNAB (You Need A Budget) API.
 
 Learning project for AI/ML engineering - building an intelligent assistant for personal finance analysis using local LLMs.
 
-See `YNAB-AI-Assistant-Project-Plan.md` for full project plan with 6 phases.
-
 ## Reference
 
-- YNAB knowledge base: `research/ynab-knowledge-base.md`
+- Audit procedure and decision rules: `skills/ynab/SKILL.md`
+- Per-budget private data (card map, priorities, payee rules) lives in
+  `~/.config/ynab-cli/`, never in this repo — see README
+
+## Do not use Claude Code memory for this project
+
+Nothing durable belongs in `~/.claude/.../memory/`. It is tied to one machine,
+cannot be moved with the project, and splits knowledge across places that drift
+apart. Everything has a home that travels:
+
+| Kind of thing | Goes to |
+|---|---|
+| A payee always categorized a certain way | `~/.config/ynab-cli/rules.json` |
+| A card number, funding priority, account fact | `~/.config/ynab-cli/profile.json` |
+| A procedure or rule for working on a budget | `skills/ynab/SKILL.md` |
+| An API quirk or SDK gotcha | this file, under YNAB API Notes |
+
+Prefer whichever the code can act on. A payee rule in `rules.json` is applied
+automatically; the same rule written as prose has to be remembered and can be
+forgotten.
+
+The one exception is a transient session handoff — where work stopped, what is
+still pending. That is deliberately throwaway, auto-loads next session, and
+should be deleted once acted on. Nothing in it should be worth keeping.
 
 ## Tech Stack
 
@@ -30,12 +51,23 @@ ynab routine --monthly           # Monthly deep check — targets, scheduled txs
 # Budget management
 ynab budget list / use           # List budgets, set default
 ynab budget plan                 # Plan view — assigned, activity, available by category
-ynab budget check                # Health check — overspent, CC mismatches, AoM, goals
-ynab budget assign               # Auto-assign RTA: overspent -> goals -> CC mismatches
+ynab budget check [--month]      # Health check — overspent, CC mismatches, AoM, goals
+ynab budget assign               # Preview RTA assignment; --apply --plan FILE writes a reviewed plan
+
+# Money questions (agent-first: run with --json)
+ynab money goals [--apply]       # Size and create safety-net, car and school goal categories
+ynab money available             # How much money is really free
+ynab money split                 # Keep in checking / move to savings / invest
 
 # Scheduled transactions
 ynab scheduled list              # View all recurring scheduled transactions
 ynab scheduled check             # Compare scheduled amounts vs recent actuals
+ynab scheduled prune / delete    # Remove schedules that generate ghosts / one schedule
+
+# Snapshots (files in ~/.config/ynab-cli/snapshots/)
+ynab snapshot save [--months N] [--label TEXT]  # Save months, categories, account balances
+ynab snapshot list               # Saved snapshots, newest first
+ynab snapshot diff OLD [NEW]     # Changes; OLD/NEW = name prefix, latest, previous; no NEW = live
 
 # Accounts & categories
 ynab status                      # Connection check
@@ -67,7 +99,8 @@ ynab report subscriptions        # Recurring charge detection
 4. Check budget before purchases (YNAB mobile app)
 
 **Monthly (15-30 min):** Run `ynab routine --monthly`. Then:
-1. Reconcile accounts in YNAB UI
+1. Reconcile accounts in YNAB UI, including investment tracking accounts
+   (Robinhood, Vanguard) with the broker's current value — YNAB never imports them
 2. `ynab budget assign` — assign RTA to categories
 3. `ynab scheduled check` — verify recurring bill amounts
 4. `ynab tx audit` — check data integrity
@@ -90,9 +123,12 @@ src/ynab_tools/
     report.py          # spending, income, payees, trends, subscriptions
     scheduled.py       # scheduled transaction list + check
     routine.py         # daily/monthly routine checks
+    money.py           # money goals, available, split
+    snapshots.py       # snapshot save, list, diff
+  money/               # Money answers: snapshot, data-quality pass, answer shape,
+                       # goals, available, split, assign
   utils/formatting.py  # Amount formatting helpers
 tests/                 # Unit tests (pytest, mocked API)
-research/              # YNAB knowledge base (best practices, metrics, API reference)
 notebooks/explore.ipynb
 ```
 
@@ -119,28 +155,25 @@ notebooks/explore.ipynb
 - Transaction date field is `var_date` (not `date`) due to SDK naming
 - Account rename is NOT supported via API — UI only
 - Category hiding: move to "Hidden Categories" group via `category_group_id`
-
-## YNAB Transfer Mismatch Problem
-
-Chase AUTOPAY descriptions ("CHASE CREDIT CRD AUTOPAY PPD ID: XXXXXX9224") don't identify which card. YNAB guesses wrong when you have multiple Chase cards. Newer format "Payment to Chase card ending in XXXX" includes the card number. Ghost transactions (no import_id, transfer counterparts) are created on the wrong card.
-
-Detection: `tx audit` finds mismatched transfers. Card-side ghosts found by checking for transactions without import_id that are transfer counterparts.
-
-Fix: Use YNAB UI to relink transfers. API can detect but not safely fix (deleting one side deletes both).
-
-## Budget Organization
-
-Category groups ordered by priority (fund top to bottom):
-1. Housing — Mortgage, HOA, Electric & Gas, Water, Internet, Home Insurance, Home Maintenance
-2. Transportation — Auto Insurance, Auto Loans, Gas, E-ZPass, Parking, Car Maintenance
-3. Family — Dependents (Rent/Music/Utilities), Pet Insurance
-4. Health — Medical, Rigoro Gym, Fitness, Health & Wellness
-5. Food & Dining — Groceries, Eating Out
-6. Subscriptions — Netflix, YouTube, Spotify, ChatGPT, GitHub Copilot, LeetCode, Cellphone, etc.
-7. Debt — Loans
-8. Savings & Goals — Savings, Investing, Vacation, Education, Home Improvement
-9. Lifestyle — Clothes, Hair, Dancing, Entertainment, Hobbies, Gifts, Travel
-10. Other — Fees, Tech
+- Reconciled transactions cannot be updated — the API returns 404
+- Matching an import to a scheduled entry CLEARS `import_id` and sets
+  `matched_transaction_id`; check both before concluding an entry is a ghost
+- Each account has a `transfer_payee_id`; setting a transaction's `payee_id` to
+  it creates a transfer and auto-generates the counterpart
+- The API has no "match" operation — `matched_transaction_id` is read-only, so
+  merging a duplicate pair is UI-only
+- A credit-card `balance` is negative when money is owed and positive when the
+  card is in credit; never take its absolute value
+- A goal created or updated through the API (`goal_target`) becomes a monthly
+  "Needed for Spending" (NEED) target; "Have a balance of … by date" (TB/TBD)
+  can only be chosen in the app, and `goal_overall_left` is only meaningful
+  once it is
+- Investment and retirement accounts never import through Direct Import, even
+  when shown as linked; their balance changes only on a manual reconcile
+- A created transaction's `payee_name` must not start with an internal payee
+  name ("Transfer : ", "Starting Balance", "Manual Balance Adjustment",
+  "Reconciliation Balance Adjustment") — the API returns 400; use a regular
+  payee such as "Vanguard Market Value" for a balance update
 
 ## Current Phase
 

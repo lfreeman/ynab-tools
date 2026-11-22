@@ -1,5 +1,14 @@
 """Formatting utilities for YNAB data."""
 
+import json
+import sys
+from typing import Any
+
+from rich.console import Console
+
+# Progress lines and warnings, kept off stdout so `--json` output stays parseable.
+err_console = Console(stderr=True)
+
 
 def millis_to_dollars(milliunits: int) -> float:
     """Convert milliunits to dollars."""
@@ -25,3 +34,13 @@ def format_amount_colored(milliunits: int) -> str:
 def short_id(uuid_val) -> str:
     """Abbreviate a UUID to first 8 characters."""
     return str(uuid_val)[:8] if uuid_val else "—"
+
+
+def print_json(data: Any) -> None:
+    """Write `data` to stdout as indented JSON, bypassing Rich.
+
+    Rich's console wraps long lines and interprets `[...]` as markup, both of
+    which corrupt machine-readable output. Values JSON cannot encode natively
+    (dates, UUIDs) are written as strings.
+    """
+    sys.stdout.write(json.dumps(data, indent=2, default=str) + "\n")

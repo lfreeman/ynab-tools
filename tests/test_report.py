@@ -1,5 +1,6 @@
 """Tests for report commands and budget check."""
 
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -15,8 +16,15 @@ from ynab_tools.commands.report import (
     _since_date,
     _trend_arrow,
 )
+from ynab_tools.config import Profile
 
 runner = CliRunner()
+
+# `budget check` warns about accounts unreconciled for 30+ days. A literal
+# date here passes only until it ages past that threshold, so derive the
+# "recently reconciled" and "long overdue" dates from today instead.
+RECENTLY_RECONCILED = (date.today() - timedelta(days=5)).isoformat()
+LONG_OVERDUE = (date.today() - timedelta(days=200)).isoformat()
 
 
 # ── Mock factories ───────────────────────────────────────────────────────────
@@ -383,7 +391,7 @@ def test_report_trends_json(mock_client):
 def test_budget_check_all_pass(mock_client):
     mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
     mock_client.list_accounts.return_value = [
-        _mock_account(last_reconciled_at="2026-03-20"),
+        _mock_account(last_reconciled_at=RECENTLY_RECONCILED),
     ]
     mock_client.list_categories.return_value = [
         _mock_category_group("Bills", [_mock_category("Rent", balance=50000)]),
@@ -399,7 +407,7 @@ def test_budget_check_all_pass(mock_client):
 def test_budget_check_overspent(mock_client):
     mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
     mock_client.list_accounts.return_value = [
-        _mock_account(last_reconciled_at="2026-03-20"),
+        _mock_account(last_reconciled_at=RECENTLY_RECONCILED),
     ]
     mock_client.list_categories.return_value = [
         _mock_category_group("Bills", [_mock_category("Groceries", balance=-25000)]),
@@ -442,7 +450,7 @@ def test_budget_check_rta_negative(mock_client):
 def test_budget_check_stale_reconciliation(mock_client):
     mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
     mock_client.list_accounts.return_value = [
-        _mock_account(name="Checking", last_reconciled_at="2026-01-01"),
+        _mock_account(name="Checking", last_reconciled_at=LONG_OVERDUE),
     ]
     mock_client.list_categories.return_value = []
     mock_client.list_transactions.return_value = []
@@ -457,7 +465,7 @@ def test_budget_check_stale_reconciliation(mock_client):
 def test_budget_check_cc_mismatch(mock_client):
     mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
     mock_client.list_accounts.return_value = [
-        _mock_account(name="Visa", acct_type="creditCard", balance=-250000, last_reconciled_at="2026-03-20"),
+        _mock_account(name="Visa", acct_type="creditCard", balance=-250000, last_reconciled_at=RECENTLY_RECONCILED),
     ]
     mock_client.list_categories.return_value = [
         _mock_category_group("Credit Card Payments", [_mock_category("Visa", balance=200000)]),
@@ -626,7 +634,7 @@ def _mock_category_with_goal(name="Savings", balance=50000, goal_under_funded=0,
 def test_budget_check_underfunded_goals(mock_client):
     mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
     mock_client.list_accounts.return_value = [
-        _mock_account(last_reconciled_at="2026-03-20"),
+        _mock_account(last_reconciled_at=RECENTLY_RECONCILED),
     ]
     mock_client.list_categories.return_value = [
         _mock_category_group(
@@ -710,7 +718,7 @@ def test_budget_check_all_new_checks_pass(mock_client):
     month.age_of_money = 60
     mock_client.get_month.return_value = month
     mock_client.list_accounts.return_value = [
-        _mock_account(last_reconciled_at="2026-03-20"),
+        _mock_account(last_reconciled_at=RECENTLY_RECONCILED),
     ]
     mock_client.list_categories.return_value = [
         _mock_category_group(
@@ -728,3 +736,156 @@ def test_budget_check_all_new_checks_pass(mock_client):
     result = runner.invoke(app, ["budget", "check"])
     assert result.exit_code == 0
     assert "All checks passed" in result.output
+
+
+def _mock_assign_category(name, group, balance=0, budgeted=0, cat_id=None):
+    c = MagicMock()
+    c.id = cat_id or f"id-{name}"
+    c.name = name
+    c.category_group_name = group
+    c.balance = balance
+    c.budgeted = budgeted
+    c.deleted = False
+    c.hidden = False
+    c.goal_under_funded = 0
+    return c
+
+
+@patch("ynab_tools.money.assign.client")
+@patch("ynab_tools.money.snapshot.load_profile")
+@patch("ynab_tools.money.snapshot.client")
+def test_assign_funds_by_profile_priority_when_rta_is_short(mock_client, mock_profile, assign_client):
+    """With too little to cover everything, the profile's order decides."""
+    month = _mock_month(to_be_budgeted=100_000)  # $100 available
+    month.categories = [
+        _mock_assign_category("Rent", "Housing", balance=-80_000),
+        _mock_assign_category("Hobbies", "Lifestyle", balance=-80_000),
+    ]
+    mock_client.get_month.return_value = month
+    mock_client.list_accounts.return_value = []
+    mock_client.list_transactions.return_value = []
+    mock_profile.return_value = Profile(funding_priority=["Housing", "Lifestyle"])
+
+    # The default only previews: nothing is written.
+    result = runner.invoke(app, ["budget", "assign"])
+    assign_client.update_month_category.assert_not_called()
+
+    assert result.exit_code == 0
+    # Only $100 available and each needs $80, so exactly one is funded.
+    # Rich wraps the warning, so collapse whitespace before matching on it.
+    flat = " ".join(result.output.split())
+    assert "Rent" in flat
+    # Hobbies appears only as left out, never as a planned item.
+    assert flat.count("Hobbies") == 1
+    assert "Hobbies: Ready to Assign ran out" in flat
+
+
+@patch("ynab_tools.money.assign.client")
+@patch("ynab_tools.money.snapshot.load_profile")
+@patch("ynab_tools.money.snapshot.client")
+def test_assign_funds_everything_when_rta_is_sufficient(mock_client, mock_profile, assign_client):
+    """An ample balance funds every category regardless of priority."""
+    month = _mock_month(to_be_budgeted=1_000_000)
+    month.categories = [
+        _mock_assign_category("Rent", "Housing", balance=-80_000),
+        _mock_assign_category("Hobbies", "Lifestyle", balance=-80_000),
+    ]
+    mock_client.get_month.return_value = month
+    mock_client.list_accounts.return_value = []
+    mock_client.list_transactions.return_value = []
+    mock_profile.return_value = Profile(funding_priority=["Housing", "Lifestyle"])
+
+    # The default only previews: nothing is written.
+    result = runner.invoke(app, ["budget", "assign"])
+    assign_client.update_month_category.assert_not_called()
+
+    assert result.exit_code == 0
+    flat = " ".join(result.output.split())
+    assert "Rent" in flat
+    assert "Hobbies" in flat
+    assert "Ready to Assign ran out" not in flat
+
+
+# ── budget check --month ─────────────────────────────────────────────────────
+
+
+def _month_tx(tx_date, amount=-10_000, payee="Shop", account="Checking", account_id="chk",
+              category_id=None, approved=True):
+    t = MagicMock()
+    t.var_date = date.fromisoformat(tx_date)
+    t.amount = amount
+    t.payee_name = payee
+    t.account_name = account
+    t.account_id = account_id
+    t.category_id = category_id
+    t.transfer_account_id = None
+    t.approved = approved
+    t.deleted = False
+    return t
+
+
+def _month_category(name, balance, group):
+    c = _mock_category(name, balance=balance)
+    c.category_group_name = group
+    return c
+
+
+@patch("ynab_tools.commands.budget.client")
+def test_budget_check_past_month_uses_that_months_data(mock_client):
+    month = _mock_month(to_be_budgeted=0)
+    month.categories = [_month_category("Rent", -5_000, "Bills")]
+    mock_client.get_month.return_value = month
+    mock_client.list_accounts.return_value = []
+    mock_client.list_transactions.return_value = [
+        _month_tx("2026-03-10"),                  # uncategorized, in March
+        _month_tx("2026-04-02"),                  # uncategorized, outside March
+        _month_tx("2026-03-12", category_id="c"),
+    ]
+
+    result = runner.invoke(app, ["budget", "check", "--month", "2026-03"])
+    output = " ".join(result.output.split())
+
+    assert result.exit_code == 0
+    mock_client.get_month.assert_called_with("2026-03-01", budget_id=None)
+    mock_client.list_categories.assert_not_called()
+    assert "Bills > Rent" in output
+    assert "1 uncategorized" in output
+    assert "skipped for a past month" in output
+
+
+@patch("ynab_tools.commands.budget.client")
+def test_budget_check_flags_mirrored_reconciliation_adjustments(mock_client):
+    """Equal and opposite adjustments on two accounts hide a payment linked to the wrong one."""
+    month = _mock_month(to_be_budgeted=0)
+    month.categories = []
+    mock_client.get_month.return_value = month
+    mock_client.list_accounts.return_value = []
+    mock_client.list_transactions.return_value = [
+        _month_tx("2026-03-23", -205_990, "Reconciliation Balance Adjustment", "Chase Freedom", "fr", "c"),
+        _month_tx("2026-03-23", 205_990, "Reconciliation Balance Adjustment", "Chase Sapphire", "sa", "c"),
+        _month_tx("2026-03-23", 14_000, "Reconciliation Balance Adjustment", "Bank of America", "boa", "c"),
+    ]
+
+    result = runner.invoke(app, ["budget", "check", "--month", "2026-03"])
+    output = " ".join(result.output.split())
+
+    assert "1 mirrored reconciliation adjustment" in output
+    assert "Chase Freedom" in output and "Chase Sapphire" in output
+    assert "Bank of America" not in output
+
+
+@patch("ynab_tools.commands.budget.client")
+def test_budget_check_card_in_credit_is_not_debt(mock_client):
+    """A positive card balance is credit; nothing needs to be set aside to pay it."""
+    mock_client.get_month.return_value = _mock_month(to_be_budgeted=0)
+    mock_client.list_accounts.return_value = [
+        _mock_account(name="Amazon", acct_type="creditCard", balance=2_754_290, last_reconciled_at=RECENTLY_RECONCILED),
+    ]
+    mock_client.list_categories.return_value = [
+        _mock_category_group("Credit Card Payments", [_mock_category("Amazon", balance=0)]),
+    ]
+    mock_client.list_transactions.return_value = []
+
+    result = runner.invoke(app, ["budget", "check"])
+
+    assert "mismatch" not in result.output.lower()

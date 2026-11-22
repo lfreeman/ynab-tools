@@ -1,8 +1,9 @@
 """Tests for formatting utilities."""
 
+import json
 from uuid import UUID
 
-from ynab_tools.utils.formatting import format_amount, format_amount_colored, millis_to_dollars, short_id
+from ynab_tools.utils.formatting import format_amount, format_amount_colored, millis_to_dollars, print_json, short_id
 
 
 def test_millis_to_dollars():
@@ -53,3 +54,10 @@ def test_short_id_none():
 
 def test_short_id_empty():
     assert short_id("") == "—"
+
+
+def test_print_json_survives_long_strings_and_brackets(capsys):
+    """Rich wraps long lines and strips [markup]; JSON output must do neither."""
+    data = [{"memo": "x" * 300, "payee": "[bold]Store[/bold]", "amount": -1000}]
+    print_json(data)
+    assert json.loads(capsys.readouterr().out) == data

@@ -25,6 +25,11 @@ def _daily_checks(budget_id: str | None = None) -> int:
     txs = client.list_transactions(budget_id=budget_id, since_date=month_str)
     txs = [t for t in txs if not t.deleted]
 
+    # Also the full history: YNAB's own banner counts every unapproved
+    # transaction, so a current-month-only view can report a clean budget while
+    # hundreds sit unapproved in earlier months.
+    all_txs = [t for t in client.list_transactions(budget_id=budget_id) if not t.deleted]
+
     attention = 0
 
     # 0. Accounts needing re-auth
@@ -45,10 +50,55 @@ def _daily_checks(budget_id: str | None = None) -> int:
         if linked:
             console.print("[green]  PASS[/green]  All linked accounts connected")
 
+    # A dropped feed raises no error flag; only the missing imports show it.
+    from ..money.quality import FEED_STALE_DAYS, stale_feeds
+
+    stale = stale_feeds(active_accounts, all_txs, date.today())
+    if stale:
+        attention += 1
+        console.print(
+            f"[red]  FAIL[/red]  {len(stale)} account(s) have not imported in {FEED_STALE_DAYS}+ days"
+            " (relink them under Bank Connections):"
+        )
+        for acct, last in stale:
+            console.print(f"         {acct.name} — last import {last or 'none on record'}")
+
+    # Structural errors come before anything that reads a balance: a ghost
+    # inflates a category, and covering it with `budget assign` funds a charge
+    # that never happened.
+    from .tx import _find_ghosts, _find_misrouted_payments, _find_unconfirmed_payments
+
+    ghosts, _ = _find_ghosts(all_txs)
+    if ghosts:
+        attention += 1
+        console.print(
+            f"[red]  FAIL[/red]  {len(ghosts)} ghost(s) totalling {format_amount(sum(g.amount for g, _ in ghosts))}"
+            " -- run: ynab scheduled prune --delete, then ynab tx ghosts --delete"
+        )
+    else:
+        console.print("[green]  PASS[/green]  No ghost transactions")
+
+    misrouted = _find_misrouted_payments(all_txs, accounts)
+    if misrouted:
+        attention += 1
+        console.print(
+            f"[red]  FAIL[/red]  {len(misrouted)} card payment(s) linked to the wrong card -- run: ynab tx transfers"
+        )
+
+    unconfirmed_payments = _find_unconfirmed_payments(all_txs)
+    if unconfirmed_payments:
+        attention += 1
+        console.print(
+            f"[yellow]  WARN[/yellow]  {len(unconfirmed_payments)} payment(s) the receiving account never confirmed"
+            f" ({format_amount(sum(p['amount'] for p in unconfirmed_payments))}) -- run: ynab tx transfers"
+        )
+
     # 1. Uncategorized transactions
+    off_budget = {str(a.id) for a in accounts if not a.on_budget}
     uncategorized = [
         t for t in txs
         if not t.transfer_account_id and not t.category_id
+        and str(t.account_id) not in off_budget
         and (t.payee_name or "") not in ("Starting Balance", "Manual Balance Adjustment")
     ]
     if uncategorized:
@@ -62,10 +112,13 @@ def _daily_checks(budget_id: str | None = None) -> int:
 
     # 2. Unapproved transactions
     unapproved = [t for t in txs if not getattr(t, "approved", True)]
-    if unapproved:
+    unapproved_all = [t for t in all_txs if not getattr(t, "approved", True)]
+    backlog = len(unapproved_all) - len(unapproved)
+    if unapproved_all:
         attention += 1
+        detail = f" ({backlog} from earlier months)" if backlog else ""
         console.print(
-            f"[yellow]  WARN[/yellow]  {len(unapproved)} unapproved transaction(s)"
+            f"[yellow]  WARN[/yellow]  {len(unapproved_all)} unapproved transaction(s){detail}"
             f" -- run: ynab tx list --unapproved"
         )
     else:
@@ -81,16 +134,24 @@ def _daily_checks(budget_id: str | None = None) -> int:
                 continue
             balance = getattr(cat, "balance", 0) or 0
             if balance < 0:
-                overspent.append((group.name, cat.name, balance))
+                overspent.append((str(cat.id), group.name, cat.name, balance))
+
+    # Ghost spending this month, per category — the part of an overspend that
+    # disappears once the ghosts are deleted.
+    ghost_by_category: dict[str, int] = {}
+    for g, _ in ghosts:
+        if str(g.var_date) >= month_str and g.category_id:
+            ghost_by_category[str(g.category_id)] = ghost_by_category.get(str(g.category_id), 0) + g.amount
 
     if overspent:
         attention += 1
-        console.print(
-            f"[red]  FAIL[/red]  {len(overspent)} overspent category(ies)"
-            f" -- run: ynab budget assign"
-        )
-        for gn, cn, bal in overspent:
-            console.print(f"         {gn} > {cn}: {format_amount_colored(bal)}")
+        fix = "remove the ghosts first, then: ynab budget assign" if ghost_by_category else "run: ynab budget assign"
+        console.print(f"[red]  FAIL[/red]  {len(overspent)} overspent category(ies) -- {fix}")
+        for cid, gn, cn, bal in overspent:
+            note = ""
+            if cid in ghost_by_category:
+                note = f"  [dim]({format_amount(-ghost_by_category[cid])} of it is ghosts)[/dim]"
+            console.print(f"         {gn} > {cn}: {format_amount_colored(bal)}{note}")
     else:
         console.print("[green]  PASS[/green]  No overspent categories")
 
@@ -99,7 +160,8 @@ def _daily_checks(budget_id: str | None = None) -> int:
     cc_accounts = [a for a in active_accounts if getattr(a, "type", "") == "creditCard"]
     cc_mismatches = []
     for cc in cc_accounts:
-        cc_balance = abs(getattr(cc, "balance", 0) or 0)
+        # Negative balance = owed; positive = card is in credit, nothing to fund.
+        cc_balance = max(0, -(getattr(cc, "balance", 0) or 0))
         for group in categories:
             if group.name.lower() != "credit card payments":
                 continue
@@ -118,10 +180,10 @@ def _daily_checks(budget_id: str | None = None) -> int:
             f"[yellow]  WARN[/yellow]  {len(cc_mismatches)} credit card payment mismatch(es)"
         )
         for name, payment, owed, diff in cc_mismatches:
+            gap = f"{format_amount(-diff)} short" if diff < 0 else f"{format_amount(diff)} more than owed"
             console.print(
-                f"         {name}: payment {format_amount_colored(payment)}"
-                f" vs owed {format_amount_colored(-owed)}"
-                f" (diff {format_amount_colored(diff)})"
+                f"         {name}: owe {format_amount(owed)},"
+                f" payment category has {format_amount(payment)} — {gap}"
             )
     elif cc_accounts:
         console.print("[green]  PASS[/green]  Credit card payments match balances")
@@ -183,6 +245,26 @@ def _monthly_checks(budget_id: str | None = None) -> int:
                 console.print(f"         {name}: never reconciled")
     else:
         console.print("[green]  PASS[/green]  All accounts reconciled within 14 days")
+
+    # 7b. Investment values: YNAB never imports them, so only a manual
+    # reconcile keeps net worth current.
+    from ..money.quality import FEED_STALE_DAYS, stale_tracking_values
+
+    tracking = [a for a in active_accounts if not a.on_budget and a.balance]
+    tracking_txs = [
+        t for a in tracking for t in client.list_transactions_by_account(str(a.id), budget_id=budget_id)
+    ]
+    stale_values = stale_tracking_values(tracking, tracking_txs, date.today())
+    if stale_values:
+        attention += 1
+        console.print(
+            f"[yellow]  WARN[/yellow]  {len(stale_values)} tracking account(s) not updated in {FEED_STALE_DAYS}+ days"
+            " (YNAB never imports investments — Reconcile each with today's value from the broker):"
+        )
+        for acct, last in stale_values:
+            console.print(f"         {acct.name} — last updated {last or 'never'}")
+    elif tracking:
+        console.print(f"[green]  PASS[/green]  Tracking account values updated within {FEED_STALE_DAYS} days")
 
     # 8. Underfunded goals
     underfunded = []
